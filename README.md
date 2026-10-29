@@ -21,8 +21,8 @@ CPU lists use the usual `0-7,16-23` syntax; the two sets must not overlap.
 | `-t, --test CPUS` | cpus running the latency-bound pointer chase | required |
 | `-n, --neighbor CPUS` | cpus running the neighbor workload | required |
 | `-s, --size SIZE` | dram chase buffer per cpu | 4× L3, min 64M |
-| `-l, --l3-size SIZE` | l3 chase buffer per cpu | ¾ × L3 / cpus sharing it |
-| `-f, --fill SIZE` | l3 flood buffer per neighbor cpu | L3 / neighbor cpus sharing it |
+| `-l, --l3-size SIZE` | l3 chase buffer per cpu | L2 + ½ × L3 / test cpus sharing it |
+| `-f, --fill SIZE` | l3 flood buffer per neighbor cpu | L2 + ¾ × L3 / neighbor cpus sharing it |
 | `-c, --chains N` | independent chains per cpu in mlp mode | 16 |
 | `-d, --duration SEC` | measurement time per scenario | 5 |
 | `-w, --warmup SEC` | warmup before each measurement | 1 |
@@ -38,16 +38,29 @@ The time per load is therefore the access latency, with prefetchers
 defeated. Two tests target different levels of the hierarchy:
 
 - **dram** – the buffer is well past L3, so every load goes to DRAM.
-- **l3** – the buffer is past L2 but small enough that all chasers sharing
-  an L3 fit in it, so every load is an L3 hit.
+- **l3** – the buffer is past L2 but small enough that the test cpus'
+  buffers fit in the L3 they share, so with an idle neighbor loads are L3
+  hits (or L2 hits for the fraction of the buffer L2 can hold).
 
 For each test the neighbor cpus run one of:
 
 | scenario | dram test | l3 test |
 |---|---|---|
-| same | the same DRAM chase | the same L3 chase |
+| same | the same DRAM chase | the same L3 chase, same size per cpu |
 | idle | nothing | nothing |
 | noisy | **mlp**: 16 independent DRAM chases per cpu, saturating memory bandwidth | **l3 flood**: streaming stores over buffers that together fill each L3 the neighbors share, evicting the test's working set with dirty lines |
+
+A core only moves lines into L3 by evicting them from L2, so both
+L3-targeting buffers are L2 plus a share of L3. The headroom (½ for the
+chase, ¾ for the flood) keeps them from spilling to DRAM through set
+conflicts and replacement; a flood that spills turns into a DRAM write
+bandwidth hog instead.
+
+The l3 chase is sized by the test cpus only. When many neighbors run the
+same chase (the base scenario), their combined footprint may exceed L3;
+that is the honest baseline on parts whose L2s together dwarf L3 (e.g.
+Graviton4: 96 × 2 MiB L2, 36 MiB L3), where not everyone can be
+L3-resident at once.
 
 For each test the report gives:
 
@@ -69,14 +82,14 @@ cpus sharing an L3 with four of the neighbors, short run:
     $ ./memqos -t 0-3 -n 4-15 -d 1 -w 0.3 -r 1
     ...
       dram test:
-        base level (neighbor runs same chase):    114.9 ns   (neighbor 6.56 GB/s)
-        idle neighbor:                            102.9 ns   boost    +11.7%
-        noisy neighbor (mlp):                     162.3 ns   penalty  +41.2%   (neighbor 26.93 GB/s)
+        base level (neighbor runs same chase):    116.2 ns   (neighbor 6.44 GB/s)
+        idle neighbor:                            102.4 ns   boost    +13.5%
+        noisy neighbor (mlp):                     155.7 ns   penalty  +33.9%   (neighbor 28.03 GB/s)
 
       l3 test:
-        base level (neighbor runs same chase):     13.3 ns   (neighbor 65.31 GB/s)
-        idle neighbor:                              9.6 ns   boost    +38.7%
-        noisy neighbor (l3 flood):                151.9 ns   penalty +1043.0%   (neighbor 731.13 GB/s)
+        base level (neighbor runs same chase):     22.2 ns   (neighbor 41.80 GB/s)
+        idle neighbor:                              9.9 ns   boost   +123.4%
+        noisy neighbor (l3 flood):                104.2 ns   penalty +369.8%   (neighbor 798.86 GB/s)
 
 Without cache partitioning, the L3 flood evicts the test's working set
 entirely and its L3 chase runs at DRAM latency.
@@ -96,9 +109,11 @@ entirely and its L3 chase runs at DRAM latency.
 - **Idle boost includes frequency effects.** When neighbor cores sleep, the
   test cores may get more turbo headroom; that is part of what an idle
   neighbor provides but is not purely a memory effect.
-- **L3 vs L2.** On parts where a core's share of L3 is close to its L2
-  size, the l3 chase can't be both L3-resident and past L2; the tool warns
-  when the buffer is less than twice L2.
+- **L3 vs L2.** The fraction of l3 chase loads that hit L2 is roughly
+  L2 / buffer size. With many test cpus per L3 the share shrinks toward
+  L2 and the test measures L2 more than L3; the tool warns when the
+  buffer is less than twice L2. Use fewer test cpus per L3 for a cleaner
+  L3 measurement.
 - **Cache allocation.** On CPUs with L3 partitioning (Intel RDT / AMD
   PQoS, via resctrl), running the neighbors in a restricted class of
   service shows how much the partitioning recovers.

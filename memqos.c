@@ -7,8 +7,9 @@
  *
  *   dram - the chase buffers are sized well past L3, so every load is a
  *          DRAM access whose latency is fully exposed.
- *   l3   - the chase buffers are sized past L2 but small enough that all
- *          chasers sharing an L3 fit in it, so every load is an L3 hit.
+ *   l3   - the chase buffers are sized past L2 but small enough that the
+ *          test cpus sharing an L3 fit in it, so with an idle neighbor
+ *          loads are L3 hits (or L2 hits, for the part L2 can hold).
  *
  * For each test the neighbor runs one of:
  *
@@ -521,10 +522,10 @@ static void usage(const char *prog)
 		"  -t, --test CPUS       cpus running the latency-bound pointer chase\n"
 		"  -n, --neighbor CPUS   cpus running the neighbor workload\n"
 		"  -s, --size SIZE       dram chase buffer per cpu (default: 4x L3, min 64M)\n"
-		"  -l, --l3-size SIZE    l3 chase buffer per cpu (default: 3/4 of L3 size /\n"
-		"                        test and neighbor cpus sharing that L3)\n"
-		"  -f, --fill SIZE       l3 flood buffer per neighbor cpu (default: L3\n"
-		"                        size / neighbor cpus sharing that L3)\n"
+		"  -l, --l3-size SIZE    l3 chase buffer per cpu (default: L2 + 1/2 of\n"
+		"                        L3 / test cpus sharing that L3)\n"
+		"  -f, --fill SIZE       l3 flood buffer per neighbor cpu (default: L2 +\n"
+		"                        3/4 of L3 / neighbor cpus sharing that L3)\n"
 		"  -c, --chains N        independent chains per cpu in mlp mode (default 16)\n"
 		"  -d, --duration SEC    measurement time per scenario (default 5)\n"
 		"  -w, --warmup SEC      warmup before each measurement (default 1)\n"
@@ -604,38 +605,49 @@ int main(int argc, char **argv)
 	memset(workers, 0, nall * sizeof(*workers));
 	struct worker *test = workers, *neigh = workers + ntest;
 
-	size_t l3_min = SIZE_MAX, l3_max = 0, fill_min = SIZE_MAX, fill_max = 0;
-	bool l2_warned = false;
+	/*
+	 * A core only moves lines into L3 by evicting them from L2, so every
+	 * L3-targeting footprint is L2 plus a share of L3.
+	 *
+	 * The l3 chase gets half of the test cpus' share of L3, and the flood
+	 * 3/4 of the neighbors' share: past either, set conflicts and
+	 * replacement start spilling to DRAM.  It is sized by the test cpus alone, and the
+	 * neighbors' "same" chase uses the same size: on parts where the
+	 * L2s together dwarf L3 not everyone can be L3-resident, and the
+	 * baseline should show that.
+	 */
+	size_t l3_chase = SIZE_MAX, l2_max = 0;
+	for (int i = 0; i < ntest; i++) {
+		int cpu = test_cpus[i];
+		size_t l3 = cache_size(cpu, 3), l2 = cache_size(cpu, 2);
+		if (!l3 && !l3_override)
+			die("cannot determine L3 size of cpu %d; use --l3-size", cpu);
+		size_t sz = l2 + l3 / l3_sharers(cpu, test_cpus, ntest) / 2;
+		if (sz < l3_chase)
+			l3_chase = sz;
+		if (l2 > l2_max)
+			l2_max = l2;
+	}
+	l3_chase = line_align(l3_override ? l3_override : l3_chase);
+	if (l3_chase < 2 * l2_max)
+		fprintf(stderr, "warning: l3 chase buffer (%zu KiB) is less than "
+			"twice L2 (%zu KiB); over half its loads may hit L2. Use "
+			"fewer test cpus per L3.\n", l3_chase >> 10, l2_max >> 10);
+
+	size_t fill_min = SIZE_MAX, fill_max = 0;
 	for (int i = 0; i < nall; i++) {
 		struct worker *w = &workers[i];
 		int cpu = all_cpus[i];
-		size_t l3 = cache_size(cpu, 3), l2 = cache_size(cpu, 2);
 		w->cpu = cpu;
-		if ((!l3_override || (i >= ntest && !fill_override)) && !l3)
-			die("cannot determine L3 size of cpu %d; use --l3-size "
-			    "and --fill", cpu);
-
-		/*
-		 * Leave headroom in L3 so that the chasers' working sets
-		 * stay resident even with some set conflicts.
-		 */
-		w->l3_size = line_align(l3_override ? l3_override
-				       : l3 / l3_sharers(cpu, all_cpus, nall) * 3 / 4);
-		if (w->l3_size < 2 * l2 && !l2_warned) {
-			fprintf(stderr, "warning: l3 chase buffer on cpu %d (%zu KiB) "
-				"is not well past L2 (%zu KiB); the l3 test will "
-				"partly measure L2\n", cpu, w->l3_size >> 10, l2 >> 10);
-			l2_warned = true;
-		}
-		if (w->l3_size < l3_min)
-			l3_min = w->l3_size;
-		if (w->l3_size > l3_max)
-			l3_max = w->l3_size;
-
+		w->l3_size = l3_chase;
 		if (i < ntest)
 			continue;
+
+		size_t l3 = cache_size(cpu, 3), l2 = cache_size(cpu, 2);
+		if (!l3 && !fill_override)
+			die("cannot determine L3 size of cpu %d; use --fill", cpu);
 		w->fill_size = line_align(fill_override ? fill_override
-					  : l3 / l3_sharers(cpu, neigh_cpus, nneigh));
+					  : l2 + l3 / l3_sharers(cpu, neigh_cpus, nneigh) * 3 / 4);
 		if (w->fill_size < fill_min)
 			fill_min = w->fill_size;
 		if (w->fill_size > fill_max)
@@ -644,9 +656,9 @@ int main(int argc, char **argv)
 
 	printf("test cpus: %d, neighbor cpus: %d, mlp chains: %u\n",
 	       ntest, nneigh, mlp_chains);
-	printf("per cpu: dram chase %zu MiB, l3 chase %zu-%zu KiB, "
+	printf("per cpu: dram chase %zu MiB, l3 chase %zu KiB (L2 %zu KiB), "
 	       "l3 flood %zu-%zu KiB (neighbors)\n",
-	       buf_size >> 20, l3_min >> 10, l3_max >> 10,
+	       buf_size >> 20, l3_chase >> 10, l2_max >> 10,
 	       fill_min >> 10, fill_max >> 10);
 	check_thp();
 	printf("building pointer chains...\n");
