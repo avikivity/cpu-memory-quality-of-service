@@ -2,17 +2,28 @@
  * memqos - measure memory subsystem quality-of-service under neighbor load.
  *
  * A latency-bound pointer-chasing workload runs on every CPU of the "test"
- * cpuset.  Meanwhile, the "neighbor" cpuset runs one of:
+ * cpuset, while the "neighbor" cpuset runs another workload.  Two tests are
+ * run, each targeting one level of the memory hierarchy:
  *
- *   same  - the same latency-bound pointer chase   (baseline)
- *   idle  - nothing                                 (best case)
- *   mlp   - many independent pointer chases per CPU (noisy neighbor, high
- *           memory-level parallelism, saturates the memory subsystem)
+ *   dram - the chase buffers are sized well past L3, so every load is a
+ *          DRAM access whose latency is fully exposed.
+ *   l3   - the chase buffers are sized past L2 but small enough that all
+ *          chasers sharing an L3 fit in it, so every load is an L3 hit.
  *
- * All buffers are sized well past L3, so every load in the chase is a
- * DRAM access whose latency is fully exposed.  The report gives the
- * baseline latency, the boost the test set gets when its neighbor is idle,
- * and the penalty it suffers when its neighbor is noisy.
+ * For each test the neighbor runs one of:
+ *
+ *   same  - the same chase as the test cpus           (baseline)
+ *   idle  - nothing                                   (best case)
+ *   noisy - for dram: many independent DRAM chases per cpu (high
+ *                     memory-level parallelism, saturates the memory
+ *                     subsystem)
+ *           for l3:   streaming stores over buffers that together fill
+ *                     each L3 the neighbors share (keeps L3 full of dirty
+ *                     lines, evicting the test cpus' working set)
+ *
+ * The report gives, per test, the baseline latency, the boost the test set
+ * gets when its neighbor is idle, and the penalty it suffers when its
+ * neighbor is noisy.
  */
 
 #define _GNU_SOURCE
@@ -35,18 +46,33 @@
 #define HUGE_PAGE (2UL << 20)
 #define CHUNK 256 /* chase steps between counter publications */
 
-enum scenario { SC_SAME, SC_IDLE, SC_MLP, NR_SCENARIOS };
-static const char *scenario_name[] = { "same", "idle", "mlp" };
+enum role { ROLE_CHASE, ROLE_MLP, ROLE_FILL };
 
-enum role { ROLE_CHASE, ROLE_MLP };
+enum test { T_DRAM, T_L3, NR_TESTS };
+
+static const struct {
+	const char *name;
+	const char *noisy_name;
+	enum role noisy;
+} tests[NR_TESTS] = {
+	[T_DRAM] = { "dram", "mlp", ROLE_MLP },
+	[T_L3] = { "l3", "l3 flood", ROLE_FILL },
+};
+
+enum scenario { SC_SAME, SC_IDLE, SC_NOISY, NR_SCENARIOS };
+static const char *scenario_name[] = { "same", "idle", "noisy" };
 
 struct worker {
 	int cpu;
-	char *buf;
-	size_t lines;
-	size_t huge; /* bytes of buf backed by huge pages */
-	void **starts; /* mlp_chains evenly spaced positions along the cycle */
+	void **starts;   /* mlp_chains evenly spaced positions in the dram cycle */
+	char *l3buf;     /* l3 chase cycle */
+	size_t l3_size;
+	char *fill;      /* l3 flood buffer; neighbors only */
+	size_t fill_size;
+	size_t mapped;   /* bytes allocated */
+	size_t huge;     /* bytes of those backed by huge pages */
 	enum role role;
+	void *head;      /* where ROLE_CHASE starts */
 	pthread_t thread;
 	/* Written by the worker, read by main; on its own cache line. */
 	_Alignas(LINE) _Atomic uint64_t loads;
@@ -54,6 +80,8 @@ struct worker {
 };
 
 static size_t buf_size;
+static size_t l3_override;
+static size_t fill_override;
 static unsigned mlp_chains = 16;
 static double duration = 5.0;
 static double warmup = 1.0;
@@ -140,25 +168,49 @@ static int parse_cpuset(const char *s, int **out)
 	return n;
 }
 
-static size_t l3_size(int cpu)
+static bool read_cache_attr(int cpu, int index, const char *attr,
+			    char *buf, size_t len)
 {
-	char path[128], buf[64];
+	char path[128];
 	snprintf(path, sizeof(path),
-		 "/sys/devices/system/cpu/cpu%d/cache/index3/size", cpu);
+		 "/sys/devices/system/cpu/cpu%d/cache/index%d/%s", cpu, index, attr);
 	FILE *f = fopen(path, "r");
 	if (!f)
-		return 0;
-	size_t sz = 0;
-	if (fgets(buf, sizeof(buf), f)) {
-		char *end;
-		sz = strtoull(buf, &end, 10);
-		if (*end == 'K')
-			sz <<= 10;
-		else if (*end == 'M')
-			sz <<= 20;
-	}
+		return false;
+	bool ok = fgets(buf, len, f);
 	fclose(f);
+	buf[strcspn(buf, "\n")] = '\0';
+	return ok;
+}
+
+/* Size of a cache level of cpu (index 2 = L2, 3 = L3), or 0 if unknown. */
+static size_t cache_size(int cpu, int index)
+{
+	char buf[64];
+	if (!read_cache_attr(cpu, index, "size", buf, sizeof(buf)))
+		return 0;
+	char *end;
+	size_t sz = strtoull(buf, &end, 10);
+	if (*end == 'K')
+		sz <<= 10;
+	else if (*end == 'M')
+		sz <<= 20;
 	return sz;
+}
+
+/* Number of cpus in the list that share cpu's L3 (including cpu itself). */
+static int l3_sharers(int cpu, const int *cpus, int ncpus)
+{
+	char buf[1024];
+	if (!read_cache_attr(cpu, 3, "shared_cpu_list", buf, sizeof(buf)))
+		return 1;
+	int *shared, nshared = parse_cpuset(buf, &shared), n = 0;
+	for (int i = 0; i < ncpus; i++)
+		for (int j = 0; j < nshared; j++)
+			if (cpus[i] == shared[j])
+				n++;
+	free(shared);
+	return n ? n : 1;
 }
 
 static size_t parse_size(const char *s)
@@ -215,44 +267,45 @@ static void check_thp(void)
 }
 
 /*
- * Build a single random cycle through all cache lines of the buffer
- * (Sattolo's algorithm), so the chase visits every line before repeating
- * and defeats the hardware prefetchers.  Runs on the worker's own cpu so
- * that first touch places the memory on the local NUMA node.
+ * Allocate a huge-page-aligned, populated buffer.  Huge pages keep TLB
+ * misses from polluting the latency.  The hint must precede population
+ * (so no MAP_POPULATE), otherwise the range is faulted in with small
+ * pages.
  */
-static void *build(void *arg)
+static char *alloc_huge(struct worker *w, size_t size)
 {
-	struct worker *w = arg;
-	pin(w->cpu);
-
-	size_t alloc = buf_size + HUGE_PAGE;
+	size = (size + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1);
+	size_t alloc = size + HUGE_PAGE;
 	char *raw = mmap(NULL, alloc, PROT_READ | PROT_WRITE,
 			 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (raw == MAP_FAILED)
 		die("mmap %zu bytes: %s", alloc, strerror(errno));
 	char *buf = (char *)(((uintptr_t)raw + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1));
-	/*
-	 * Huge pages keep TLB misses from polluting the DRAM latency.  The
-	 * hint must precede population (so no MAP_POPULATE), otherwise the
-	 * range is faulted in with small pages.
-	 */
-	if (madvise(buf, buf_size, MADV_HUGEPAGE))
+	if (madvise(buf, size, MADV_HUGEPAGE))
 		fprintf(stderr, "warning: MADV_HUGEPAGE: %s\n", strerror(errno));
-	if (madvise(buf, buf_size, MADV_POPULATE_WRITE)) {
+	if (madvise(buf, size, MADV_POPULATE_WRITE)) {
 		if (errno != EINVAL)
-			die("MADV_POPULATE_WRITE %zu bytes: %s", buf_size,
+			die("MADV_POPULATE_WRITE %zu bytes: %s", size,
 			    strerror(errno));
 		/* Kernel older than 5.14: populate by touching. */
-		for (size_t off = 0; off < buf_size; off += 4096)
+		for (size_t off = 0; off < size; off += 4096)
 			buf[off] = 0;
 	}
-	w->huge = anon_huge_bytes(buf);
+	w->mapped += size;
+	w->huge += anon_huge_bytes(buf);
+	return buf;
+}
 
-	size_t n = buf_size / LINE;
+/*
+ * Link the first n cache lines of buf into a single random cycle
+ * (Sattolo's algorithm), so the chase visits every line before repeating
+ * and defeats the hardware prefetchers.
+ */
+static void make_cycle(char *buf, size_t n, uint64_t seed)
+{
 #define IDX(i) (*(uint64_t *)(buf + (i) * LINE))
 	for (size_t i = 0; i < n; i++)
 		IDX(i) = i;
-	uint64_t seed = 0x9e3779b97f4a7c15ULL ^ ((uint64_t)w->cpu << 32 | 1);
 	for (size_t i = n - 1; i > 0; i--) {
 		size_t j = xorshift64(&seed) % i;
 		uint64_t t = IDX(i);
@@ -262,6 +315,21 @@ static void *build(void *arg)
 	for (size_t i = 0; i < n; i++)
 		IDX(i) = (uint64_t)(uintptr_t)(buf + IDX(i) * LINE);
 #undef IDX
+}
+
+/*
+ * Set up a worker's buffers.  Runs on the worker's own cpu so that first
+ * touch places the memory on the local NUMA node.
+ */
+static void *build(void *arg)
+{
+	struct worker *w = arg;
+	pin(w->cpu);
+
+	uint64_t seed = 0x9e3779b97f4a7c15ULL ^ ((uint64_t)w->cpu << 32 | 1);
+	char *buf = alloc_huge(w, buf_size);
+	size_t n = buf_size / LINE;
+	make_cycle(buf, n, seed);
 
 	/* Find evenly spaced starting points along the cycle for mlp mode. */
 	w->starts = malloc(mlp_chains * sizeof(*w->starts));
@@ -273,8 +341,11 @@ static void *build(void *arg)
 			p = *p;
 	}
 
-	w->buf = buf;
-	w->lines = n;
+	w->l3buf = alloc_huge(w, w->l3_size);
+	make_cycle(w->l3buf, w->l3_size / LINE, ~seed);
+
+	if (w->fill_size)
+		w->fill = alloc_huge(w, w->fill_size);
 	return NULL;
 }
 
@@ -285,7 +356,7 @@ static void *build(void *arg)
 /* Latency-bound: every load depends on the previous one. */
 static void run_chase(struct worker *w)
 {
-	void *p = w->starts[0];
+	void *p = w->head;
 	uint64_t loads = 0;
 
 	while (!atomic_load_explicit(&stop, memory_order_relaxed)) {
@@ -298,7 +369,7 @@ static void run_chase(struct worker *w)
 	w->sink = p;
 }
 
-/* Throughput-bound: mlp_chains independent chases interleaved. */
+/* Throughput-bound: mlp_chains independent DRAM chases interleaved. */
 static void run_mlp(struct worker *w)
 {
 	unsigned k, nk = mlp_chains;
@@ -317,20 +388,45 @@ static void run_mlp(struct worker *w)
 		w->sink = (char *)w->sink + (uintptr_t)p[k];
 }
 
+/*
+ * Cache-bound: one store per line, streaming over a buffer sized so that
+ * all neighbors sharing an L3 together fill it.  Lines cycle through L2
+ * into L3 continuously, and they are dirty, so evicting them costs a
+ * writeback.
+ */
+static void run_fill(struct worker *w)
+{
+	char *b = w->fill;
+	size_t size = w->fill_size, off = 0;
+	uint64_t lines = 0;
+
+	while (!atomic_load_explicit(&stop, memory_order_relaxed)) {
+		for (int i = 0; i < CHUNK; i++) {
+			*(volatile uint64_t *)(b + off) = lines + i;
+			off += LINE;
+			if (off == size)
+				off = 0;
+		}
+		lines += CHUNK;
+		atomic_store_explicit(&w->loads, lines, memory_order_relaxed);
+	}
+}
+
 static void *run(void *arg)
 {
 	struct worker *w = arg;
 	pin(w->cpu);
-	if (w->role == ROLE_CHASE)
-		run_chase(w);
-	else
-		run_mlp(w);
+	switch (w->role) {
+	case ROLE_CHASE: run_chase(w); break;
+	case ROLE_MLP: run_mlp(w); break;
+	case ROLE_FILL: run_fill(w); break;
+	}
 	return NULL;
 }
 
-static void spawn(struct worker *w, pthread_attr_t *attr, void *(*fn)(void *))
+static void spawn(struct worker *w, void *(*fn)(void *))
 {
-	int r = pthread_create(&w->thread, attr, fn, w);
+	int r = pthread_create(&w->thread, NULL, fn, w);
 	if (r)
 		die("pthread_create: %s", strerror(r));
 }
@@ -339,10 +435,16 @@ struct result {
 	double test_ns;		/* mean ns per load across test cpus */
 	double test_min_ns;	/* fastest test cpu */
 	double test_max_ns;	/* slowest test cpu */
-	double neigh_gbps;	/* aggregate neighbor load bandwidth */
+	double neigh_gbps;	/* aggregate neighbor bandwidth (lines touched) */
 };
 
-static struct result run_scenario(enum scenario sc,
+static void set_chase(struct worker *w, enum test t)
+{
+	w->role = ROLE_CHASE;
+	w->head = t == T_L3 ? (void *)w->l3buf : w->starts[0];
+}
+
+static struct result run_scenario(enum test t, enum scenario sc,
 				  struct worker *test, int ntest,
 				  struct worker *neigh, int nneigh)
 {
@@ -350,12 +452,15 @@ static struct result run_scenario(enum scenario sc,
 	int nall = 0;
 
 	for (int i = 0; i < ntest; i++) {
-		test[i].role = ROLE_CHASE;
+		set_chase(&test[i], t);
 		all[nall++] = &test[i];
 	}
 	if (sc != SC_IDLE) {
 		for (int i = 0; i < nneigh; i++) {
-			neigh[i].role = sc == SC_MLP ? ROLE_MLP : ROLE_CHASE;
+			if (sc == SC_SAME)
+				set_chase(&neigh[i], t);
+			else
+				neigh[i].role = tests[t].noisy;
 			all[nall++] = &neigh[i];
 		}
 	}
@@ -363,7 +468,7 @@ static struct result run_scenario(enum scenario sc,
 	atomic_store(&stop, false);
 	for (int i = 0; i < nall; i++) {
 		atomic_store(&all[i]->loads, 0);
-		spawn(all[i], NULL, run);
+		spawn(all[i], run);
 	}
 
 	sleep_for(warmup);
@@ -415,7 +520,11 @@ static void usage(const char *prog)
 		"\n"
 		"  -t, --test CPUS       cpus running the latency-bound pointer chase\n"
 		"  -n, --neighbor CPUS   cpus running the neighbor workload\n"
-		"  -s, --size SIZE       buffer per cpu (default: 4x L3, min 64M)\n"
+		"  -s, --size SIZE       dram chase buffer per cpu (default: 4x L3, min 64M)\n"
+		"  -l, --l3-size SIZE    l3 chase buffer per cpu (default: 3/4 of L3 size /\n"
+		"                        test and neighbor cpus sharing that L3)\n"
+		"  -f, --fill SIZE       l3 flood buffer per neighbor cpu (default: L3\n"
+		"                        size / neighbor cpus sharing that L3)\n"
 		"  -c, --chains N        independent chains per cpu in mlp mode (default 16)\n"
 		"  -d, --duration SEC    measurement time per scenario (default 5)\n"
 		"  -w, --warmup SEC      warmup before each measurement (default 1)\n"
@@ -426,12 +535,20 @@ static void usage(const char *prog)
 	exit(2);
 }
 
+static size_t line_align(size_t sz)
+{
+	sz &= ~(size_t)(LINE - 1);
+	return sz < 2 * LINE ? 2 * LINE : sz;
+}
+
 int main(int argc, char **argv)
 {
 	static const struct option opts[] = {
 		{ "test", required_argument, NULL, 't' },
 		{ "neighbor", required_argument, NULL, 'n' },
 		{ "size", required_argument, NULL, 's' },
+		{ "l3-size", required_argument, NULL, 'l' },
+		{ "fill", required_argument, NULL, 'f' },
 		{ "chains", required_argument, NULL, 'c' },
 		{ "duration", required_argument, NULL, 'd' },
 		{ "warmup", required_argument, NULL, 'w' },
@@ -442,11 +559,13 @@ int main(int argc, char **argv)
 	int *test_cpus = NULL, *neigh_cpus = NULL, ntest = 0, nneigh = 0;
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "t:n:s:c:d:w:r:h", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "t:n:s:l:f:c:d:w:r:h", opts, NULL)) != -1) {
 		switch (opt) {
 		case 't': ntest = parse_cpuset(optarg, &test_cpus); break;
 		case 'n': nneigh = parse_cpuset(optarg, &neigh_cpus); break;
 		case 's': buf_size = parse_size(optarg); break;
+		case 'l': l3_override = parse_size(optarg); break;
+		case 'f': fill_override = parse_size(optarg); break;
 		case 'c': mlp_chains = (unsigned)atoi(optarg); break;
 		case 'd': duration = atof(optarg); break;
 		case 'w': warmup = atof(optarg); break;
@@ -463,14 +582,16 @@ int main(int argc, char **argv)
 			if (test_cpus[i] == neigh_cpus[j])
 				die("cpu %d is in both cpusets", test_cpus[i]);
 
+	int nall = ntest + nneigh;
+	int all_cpus[nall];
+	memcpy(all_cpus, test_cpus, ntest * sizeof(int));
+	memcpy(all_cpus + ntest, neigh_cpus, nneigh * sizeof(int));
+
 	if (!buf_size) {
 		size_t l3 = 0;
-		for (int i = 0; i < ntest; i++)
-			if (l3_size(test_cpus[i]) > l3)
-				l3 = l3_size(test_cpus[i]);
-		for (int i = 0; i < nneigh; i++)
-			if (l3_size(neigh_cpus[i]) > l3)
-				l3 = l3_size(neigh_cpus[i]);
+		for (int i = 0; i < nall; i++)
+			if (cache_size(all_cpus[i], 3) > l3)
+				l3 = cache_size(all_cpus[i], 3);
 		buf_size = 4 * l3;
 		if (buf_size < (64UL << 20))
 			buf_size = 64UL << 20;
@@ -479,72 +600,117 @@ int main(int argc, char **argv)
 	if (buf_size / LINE < 2 * mlp_chains)
 		die("buffer too small");
 
-	struct worker *test = aligned_alloc(LINE, ntest * sizeof(*test));
-	struct worker *neigh = aligned_alloc(LINE, nneigh * sizeof(*neigh));
-	memset(test, 0, ntest * sizeof(*test));
-	memset(neigh, 0, nneigh * sizeof(*neigh));
-	for (int i = 0; i < ntest; i++)
-		test[i].cpu = test_cpus[i];
-	for (int i = 0; i < nneigh; i++)
-		neigh[i].cpu = neigh_cpus[i];
+	struct worker *workers = aligned_alloc(LINE, nall * sizeof(*workers));
+	memset(workers, 0, nall * sizeof(*workers));
+	struct worker *test = workers, *neigh = workers + ntest;
 
-	printf("test cpus: %d, neighbor cpus: %d, buffer per cpu: %zu MiB "
-	       "(total %zu MiB), mlp chains: %u\n",
-	       ntest, nneigh, buf_size >> 20,
-	       (buf_size >> 20) * (ntest + nneigh), mlp_chains);
+	size_t l3_min = SIZE_MAX, l3_max = 0, fill_min = SIZE_MAX, fill_max = 0;
+	bool l2_warned = false;
+	for (int i = 0; i < nall; i++) {
+		struct worker *w = &workers[i];
+		int cpu = all_cpus[i];
+		size_t l3 = cache_size(cpu, 3), l2 = cache_size(cpu, 2);
+		w->cpu = cpu;
+		if ((!l3_override || (i >= ntest && !fill_override)) && !l3)
+			die("cannot determine L3 size of cpu %d; use --l3-size "
+			    "and --fill", cpu);
+
+		/*
+		 * Leave headroom in L3 so that the chasers' working sets
+		 * stay resident even with some set conflicts.
+		 */
+		w->l3_size = line_align(l3_override ? l3_override
+				       : l3 / l3_sharers(cpu, all_cpus, nall) * 3 / 4);
+		if (w->l3_size < 2 * l2 && !l2_warned) {
+			fprintf(stderr, "warning: l3 chase buffer on cpu %d (%zu KiB) "
+				"is not well past L2 (%zu KiB); the l3 test will "
+				"partly measure L2\n", cpu, w->l3_size >> 10, l2 >> 10);
+			l2_warned = true;
+		}
+		if (w->l3_size < l3_min)
+			l3_min = w->l3_size;
+		if (w->l3_size > l3_max)
+			l3_max = w->l3_size;
+
+		if (i < ntest)
+			continue;
+		w->fill_size = line_align(fill_override ? fill_override
+					  : l3 / l3_sharers(cpu, neigh_cpus, nneigh));
+		if (w->fill_size < fill_min)
+			fill_min = w->fill_size;
+		if (w->fill_size > fill_max)
+			fill_max = w->fill_size;
+	}
+
+	printf("test cpus: %d, neighbor cpus: %d, mlp chains: %u\n",
+	       ntest, nneigh, mlp_chains);
+	printf("per cpu: dram chase %zu MiB, l3 chase %zu-%zu KiB, "
+	       "l3 flood %zu-%zu KiB (neighbors)\n",
+	       buf_size >> 20, l3_min >> 10, l3_max >> 10,
+	       fill_min >> 10, fill_max >> 10);
 	check_thp();
 	printf("building pointer chains...\n");
 	fflush(stdout);
-	for (int i = 0; i < ntest; i++)
-		spawn(&test[i], NULL, build);
-	for (int i = 0; i < nneigh; i++)
-		spawn(&neigh[i], NULL, build);
-	for (int i = 0; i < ntest; i++)
-		pthread_join(test[i].thread, NULL);
-	for (int i = 0; i < nneigh; i++)
-		pthread_join(neigh[i].thread, NULL);
+	for (int i = 0; i < nall; i++)
+		spawn(&workers[i], build);
+	for (int i = 0; i < nall; i++)
+		pthread_join(workers[i].thread, NULL);
 
-	size_t huge = 0;
-	for (int i = 0; i < ntest; i++)
-		huge += test[i].huge;
-	for (int i = 0; i < nneigh; i++)
-		huge += neigh[i].huge;
-	double huge_pct = 100.0 * huge / ((double)buf_size * (ntest + nneigh));
-	printf("huge page coverage: %.1f%%\n", huge_pct);
+	size_t huge = 0, mapped = 0;
+	for (int i = 0; i < nall; i++) {
+		huge += workers[i].huge;
+		mapped += workers[i].mapped;
+	}
+	double huge_pct = 100.0 * huge / mapped;
+	printf("memory: %zu MiB, huge page coverage: %.1f%%\n",
+	       mapped >> 20, huge_pct);
 	if (huge_pct < 90)
 		fprintf(stderr, "warning: low huge page coverage; TLB misses "
 			"will inflate latency (memory fragmented? try "
 			"echo 1 > /proc/sys/vm/compact_memory)\n");
 
-	double ns[NR_SCENARIOS][rounds], gbps[NR_SCENARIOS][rounds];
+	double ns[NR_TESTS][NR_SCENARIOS][rounds];
+	double gbps[NR_TESTS][NR_SCENARIOS][rounds];
 
-	printf("\n%-6s %-5s %10s %10s %10s %14s\n", "round", "neigh",
+	printf("\n%-6s %-5s %-9s %10s %10s %10s %14s\n", "round", "test", "neigh",
 	       "ns/load", "min", "max", "neigh GB/s");
 	for (unsigned r = 0; r < rounds; r++) {
 		/* Interleave scenarios so slow drift affects all of them alike. */
-		for (int sc = 0; sc < NR_SCENARIOS; sc++) {
-			struct result res = run_scenario(sc, test, ntest,
-							 neigh, nneigh);
-			ns[sc][r] = res.test_ns;
-			gbps[sc][r] = res.neigh_gbps;
-			printf("%-6u %-5s %10.1f %10.1f %10.1f %14.2f\n", r + 1,
-			       scenario_name[sc], res.test_ns, res.test_min_ns,
-			       res.test_max_ns, res.neigh_gbps);
-			fflush(stdout);
+		for (int t = 0; t < NR_TESTS; t++) {
+			for (int sc = 0; sc < NR_SCENARIOS; sc++) {
+				struct result res = run_scenario(t, sc, test, ntest,
+								 neigh, nneigh);
+				ns[t][sc][r] = res.test_ns;
+				gbps[t][sc][r] = res.neigh_gbps;
+				printf("%-6u %-5s %-9s %10.1f %10.1f %10.1f %14.2f\n",
+				       r + 1, tests[t].name,
+				       sc == SC_NOISY ? tests[t].noisy_name
+						      : scenario_name[sc],
+				       res.test_ns, res.test_min_ns,
+				       res.test_max_ns, res.neigh_gbps);
+				fflush(stdout);
+			}
 		}
 	}
 
-	double base = median(ns[SC_SAME], rounds);
-	double idle = median(ns[SC_IDLE], rounds);
-	double noisy = median(ns[SC_MLP], rounds);
-
 	printf("\nmedian of %u rounds, test-set latency per dependent load:\n", rounds);
-	printf("  base level (neighbor runs same chase): %8.1f ns   (neighbor %.2f GB/s)\n",
-	       base, median(gbps[SC_SAME], rounds));
-	printf("  idle neighbor:                         %8.1f ns   boost   %+6.1f%%\n",
-	       idle, (base / idle - 1) * 100);
-	printf("  noisy neighbor (mlp):                  %8.1f ns   penalty %+6.1f%%   (neighbor %.2f GB/s)\n",
-	       noisy, (noisy / base - 1) * 100, median(gbps[SC_MLP], rounds));
+	for (int t = 0; t < NR_TESTS; t++) {
+		double base = median(ns[t][SC_SAME], rounds);
+		double idle = median(ns[t][SC_IDLE], rounds);
+		double noisy = median(ns[t][SC_NOISY], rounds);
+		char label[64];
+
+		printf("\n  %s test:\n", tests[t].name);
+		printf("    base level (neighbor runs same chase): %8.1f ns   (neighbor %.2f GB/s)\n",
+		       base, median(gbps[t][SC_SAME], rounds));
+		printf("    idle neighbor:                         %8.1f ns   boost   %+6.1f%%\n",
+		       idle, (base / idle - 1) * 100);
+		snprintf(label, sizeof(label), "noisy neighbor (%s):", tests[t].noisy_name);
+		printf("    %-38s %8.1f ns   penalty %+6.1f%%   (neighbor %.2f GB/s)\n",
+		       label, noisy, (noisy / base - 1) * 100,
+		       median(gbps[t][SC_NOISY], rounds));
+	}
 	printf("\nboost = base/idle - 1 (speedup); penalty = noisy/base - 1 (slowdown)\n");
+	printf("neighbor GB/s counts cache lines touched, not DRAM traffic\n");
 	return 0;
 }
